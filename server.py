@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-TradingView MCP Server
-Provides live market data via tradingview-ta library
+TradingView MCP Server - HTTP/SSE Mode
+Works with Railway + Claude.ai connector
 """
 
 import json
 import asyncio
+import uvicorn
 from typing import Any
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from mcp.types import Tool, TextContent
-from tradingview_ta import TA_Handler, Interval, Exchange
+from tradingview_ta import TA_Handler, Interval
 
 app = Server("tradingview-mcp")
 
@@ -90,25 +95,10 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Trading symbol e.g. XAUUSD, EURUSD, BTCUSD, AAPL, TSLA"
-                    },
-                    "exchange": {
-                        "type": "string",
-                        "description": "Exchange e.g. OANDA, BINANCE, NASDAQ, NYSE, FX_IDC",
-                        "default": "OANDA"
-                    },
-                    "screener": {
-                        "type": "string",
-                        "description": "Screener: forex, crypto, america, europe, etc.",
-                        "default": "forex"
-                    },
-                    "interval": {
-                        "type": "string",
-                        "description": "Timeframe: 1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 1W, 1M",
-                        "default": "1h"
-                    }
+                    "symbol": {"type": "string", "description": "Trading symbol e.g. XAUUSD"},
+                    "exchange": {"type": "string", "default": "OANDA"},
+                    "screener": {"type": "string", "default": "forex"},
+                    "interval": {"type": "string", "default": "1h"}
                 },
                 "required": ["symbol"]
             }
@@ -119,13 +109,12 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string", "description": "Trading symbol e.g. XAUUSD"},
+                    "symbol": {"type": "string"},
                     "exchange": {"type": "string", "default": "OANDA"},
                     "screener": {"type": "string", "default": "forex"},
                     "intervals": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of intervals e.g. ['15m','1h','4h','1d']",
                         "default": ["15m", "1h", "4h", "1d"]
                     }
                 },
@@ -139,12 +128,12 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
         if name == "get_quote":
-            symbol = arguments["symbol"]
-            exchange = arguments.get("exchange", "OANDA")
-            screener = arguments.get("screener", "forex")
-            interval = arguments.get("interval", "1h")
-
-            result = get_analysis(symbol, exchange, screener, interval)
+            result = get_analysis(
+                arguments["symbol"],
+                arguments.get("exchange", "OANDA"),
+                arguments.get("screener", "forex"),
+                arguments.get("interval", "1h")
+            )
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         elif name == "get_multi_timeframe":
@@ -152,27 +141,44 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             exchange = arguments.get("exchange", "OANDA")
             screener = arguments.get("screener", "forex")
             intervals = arguments.get("intervals", ["15m", "1h", "4h", "1d"])
-
             results = {}
             for interval in intervals:
                 try:
                     results[interval] = get_analysis(symbol, exchange, screener, interval)
                 except Exception as e:
                     results[interval] = {"error": str(e)}
-
             return [TextContent(type="text", text=json.dumps(results, indent=2))]
 
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
         return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
 
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+# SSE Transport
+sse = SseServerTransport("/messages/")
 
+
+async def handle_sse(request: Request):
+    async with sse.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await app.run(
+            streams[0], streams[1], app.create_initialization_options()
+        )
+
+
+async def health(request: Request):
+    return JSONResponse({"status": "ok", "server": "tradingview-mcp"})
+
+
+starlette_app = Starlette(
+    routes=[
+        Route("/health", health),
+        Route("/sse", handle_sse),
+        Mount("/messages/", app=sse.handle_post_message),
+    ]
+)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    uvicorn.run(starlette_app, host="0.0.0.0", port=8080)
+
